@@ -2,19 +2,57 @@
 
 ## 一、术语和定义
 
+### 1.1 核心术语
+
 | 术语 | 定义 |
 |------|------|
 | **Gap-Proxy** | 项目名称。一个 Linux 用户空间二层代理隧道系统。 |
-| **AF_PACKET** | Linux 内核提供的原始套接字接口，允许用户态程序直接在数据链路层（L2）收发以太网帧，绕过内核 TCP/IP 协议栈。 |
+| **AF_PACKET** | Linux 内核提供的原始套接字接口，允许用户态程序直接在数据链路层（L2）收发以太网帧，绕过内核 TCP/IP 协议栈。使用 `socket(AF_PACKET, SOCK_RAW, htons(ethertype))` 创建。 |
 | **EtherType** | 以太网帧头中的 2 字节类型字段，用于标识上层协议。Gap-Proxy 使用自定义 EtherType（默认 `0x88B5`）区分本协议帧。 |
-| **KCP** | 一种基于 UDP 的可靠传输协议（KCP - A Fast and Reliable ARQ Protocol），提供比 TCP 快 30%-40% 的吞吐量，通过可配置的自动重传和流量控制实现可靠交付。 |
-| **BPF** | Berkeley Packet Filter，Linux 内核的包过滤机制。Gap-Proxy 使用 BPF 在内核层按 EtherType 过滤帧，减少用户态处理开销。 |
-| **TPACKET_V2** | Linux AF_PACKET 的零拷贝环形缓冲区接口，用户态与内核态通过共享内存区域传递帧描述符，避免数据拷贝。 |
-| **SM4-CBC** | 国密 SM4 分组密码的 CBC 模式（128 位密钥），用于帧负载加密。 |
-| **SM3-HMAC** | 基于国密 SM3 哈希算法的 HMAC（256 位摘要），用于帧完整性校验和身份认证。 |
-| **Encrypt-then-MAC** | 先加密后认证的安全设计模式：先用 SM4-CBC 加密明文，再对密文计算 SM3-HMAC，防止 padding oracle 等侧信道攻击。 |
+| **KCP** | KCP - A Fast and Reliable ARQ Protocol（skywind3000/kcp）。基于 UDP 思想的可靠传输协议，提供比 TCP 快 30%-40% 的吞吐量，通过可配置的自动重传（ARQ）、流量控制和拥塞控制实现可靠交付。 |
+| **BPF** | Berkeley Packet Filter，Linux 内核的包过滤机制。Gap-Proxy 在 AF_PACKET 套接字上附加 BPF 程序，在内核层按 EtherType 过滤帧，避免无关帧进入用户态。 |
+| **TPACKET_V2** | Linux AF_PACKET 的零拷贝环形缓冲区接口（`setsockopt(PACKET_RX_RING)` / `PACKET_TX_RING)`），用户态与内核态通过 `mmap` 共享内存区域传递帧描述符，消除 `recvfrom`/`sendto` 的数据拷贝开销。 |
+| **SM4-CBC** | 国密 SM4 分组密码的 CBC 模式。128 位密钥 + 128 位随机 IV，16 字节分组，PKCS7 填充。用于帧负载加密。 |
+| **SM3-HMAC** | 基于国密 SM3 哈希算法（256 位摘要，512 位块）的 HMAC。用于帧完整性校验和消息认证。 |
+| **Encrypt-then-MAC** | 先加密后认证的安全设计模式：先用 SM4-CBC 加密明文 → 对密文计算 SM3-HMAC → 将 HMAC 追加到密文尾部。防止 padding oracle 等侧信道攻击。 |
 
-### 节点角色（Node Role）
+### 1.2 MyProto 帧格式
+
+Gap-Proxy 使用自定义 MyProto 协议封装 KCP 负载。已建立的通道（ESTABLISHED 状态）上所有数据帧均经过 KCP 封装后再由 MyProto 组帧。
+
+**帧头（9 字节，紧凑布局，`__attribute__((packed))`）**：
+
+```
+Byte  0..3:  channel_id    (uint32_t, big-endian)  通道标识符
+Byte  4:     flags         (uint8_t)                帧类型标志位
+Byte  5..6:  payload_len   (uint16_t, big-endian)   负载长度（不含帧头和尾帧）
+Byte  7..8:  header_crc    (uint16_t)               CRC-16/CCITT 帧头校验
+```
+
+**帧尾（4 字节，可选）**：
+
+```
+Byte  N..N+3: frame_crc32  (uint32_t, little-endian) CRC-32C 全帧校验
+```
+
+**帧总长度**：9（头） + 0..65535（负载） + 4（尾，可选）= 13..65548 字节
+
+**标志位（flags）定义**：
+
+| 位掩码 | 宏 | 含义 |
+|:---:|------|------|
+| `0x01` | `MPF_SYN` | 连接建立请求（三次握手第一步） |
+| `0x02` | `MPF_ACK` | 确认帧（握手/数据传输确认） |
+| `0x04` | `MPF_FIN` | 连接关闭请求（优雅断开） |
+| `0x08` | `MPF_RST` | 连接重置（异常断开） |
+| `0x10` | `MPF_DATA` | 数据帧（承载应用层数据） |
+| `0x20` | `MPF_PING` | 心跳探测帧 |
+| `0x40` | `MPF_PONG` | 心跳应答帧 |
+| `0x80` | `MPF_CRYPTO` | 加密帧标记（负载已加密） |
+
+**控制帧识别**：`flags & MPF_CTRL_MASK`（SYN/ACK/FIN/RST/PING/PONG）为非数据帧，走控制面处理；仅 `MPF_DATA` 帧将 KCP 负载递交给应用层。
+
+### 1.3 节点角色（Node Role）
 
 | 角色 | 值 | 定义 |
 |------|:---:|------|
@@ -22,22 +60,22 @@
 | `MANAGER` | 1 | Master 管理进程，负责配置分发、进程监管、信号转发、API 服务 |
 | `WORKER` | 2 | Worker 工作进程，负责数据面处理（AF_PACKET + KCP + 透明代理） |
 
-### 节点类型（Node Type）
+### 1.4 节点类型（Node Type）
 
 | 类型 | 值 | 定义 |
 |------|:---:|------|
-| `FRONTEND` | 0 | 前端节点，接收客户端 TCP/UDP 连接，通过 KCP 隧道转发到后端节点 |
-| `BACKEND` | 1 | 后端节点，接收前端转发的 KCP 隧道数据，代理到目标服务 |
+| `FRONTEND` | 0 | 前端节点：接收客户端 TCP/UDP 连接，通过 KCP 隧道转发到后端 |
+| `BACKEND` | 1 | 后端节点：接收前端转发的 KCP 流量，代理到目标服务 |
 
-### 通道角色（Channel Role）
+### 1.5 通道角色（Channel Role）
 
 | 角色 | 值 | 定义 |
 |------|:---:|------|
-| `INITIATOR` | 0 | 主动发起方，发送 SYN 帧驱动三次握手 |
-| `RESPONDER` | 1 | 被动响应方，收到 SYN 后回复 ACK 完成握手 |
-| `LISTENER` | 2 | 纯监听方，仅监听本地端口，由对端 SYN 触发握手 |
+| `INITIATOR` | 0 | 主动发起方：发送 SYN 帧驱动三次握手 |
+| `RESPONDER` | 1 | 被动响应方：收到 SYN 后回复 ACK 完成握手 |
+| `LISTENER` | 2 | 纯监听方：仅监听本地端口，由对端 SYN 触发握手 |
 
-### 通道状态（Channel State）
+### 1.6 通道状态机（Channel State）
 
 ```
 CLOSED ──(SYN)──► SYN_SENT ──(ACK)──► ESTABLISHED ──(FIN)──► FIN_SENT
@@ -49,31 +87,31 @@ CLOSED ──(SYN)──► SYN_SENT ──(ACK)──► ESTABLISHED ──(FIN
                         CLOSED_ZOMBIE (超时回收)
 ```
 
-| 状态 | 定义 |
-|------|------|
-| `CLOSED` | 初始状态，通道未建立 |
-| `SYN_SENT` | 已发送 SYN 帧，等待对端 ACK |
-| `SYN_RCVD` | 已收到 SYN 帧，已回复 ACK，等待确认 |
-| `ESTABLISHED` | 连接已建立，可双向传输数据 |
-| `FIN_SENT` | 已发送 FIN 帧，等待对端确认关闭 |
-| `FIN_RCVD` | 已收到 FIN 帧，已回复 ACK，等待本地关闭 |
-| `CLOSED_ZOMBIE` | 等待超时回收的僵尸状态 |
+| 状态 | 定义 | 超时 | 进入条件 |
+|------|------|:---:|------|
+| `CLOSED` | 初始状态，通道未建立 | — | 通道创建/销毁后 |
+| `SYN_SENT` | 已发送 SYN 帧，等待对端 ACK | 3s | 本地发起连接 |
+| `SYN_RCVD` | 已收到 SYN 帧，已回复 ACK，等待确认 | 3s | 收到对端 SYN |
+| `ESTABLISHED` | 连接已建立，可双向传输数据 | keepalive 超时 | 握手完成 |
+| `FIN_SENT` | 已发送 FIN 帧，等待对端确认 | 3s | 本地主动关闭 |
+| `FIN_RCVD` | 已收到 FIN 帧，已回复 ACK，等待本地关闭 | 3s | 收到对端 FIN |
+| `CLOSED_ZOMBIE` | 等待超时回收的僵尸状态 | 5s | FIN/RST 交换完成 |
 
-### 加密模式
+### 1.7 加密模式
 
-| 模式 | 值 | 定义 |
-|------|:---:|------|
-| `NONE` | 0 | 不加密，payload 明文传输（仅可信内网） |
-| `SM4_SM3` | 1 | SM4-CBC 加密 + SM3-HMAC 完整性校验（生产推荐） |
+| 模式 | 值 | 密钥长度 | IV 长度 | HMAC 长度 | 定义 |
+|------|:---:|:---:|:---:|:---:|------|
+| `NONE` | 0 | — | — | — | 不加密，payload 明文传输（仅可信内网） |
+| `SM4_SM3` | 1 | 16 字节 | 16 字节 | 32 字节 | SM4-CBC + SM3-HMAC（生产推荐） |
 
-### 通道标志（Channel Flags）
+### 1.8 通道标志（Channel Flags）
 
 | 标志 | 值 | 定义 |
 |------|:---:|------|
-| `STATIC_LISTENER` | 0x01 | 静态监听通道，不被热重载销毁 |
-| `RELOAD_MARKED` | 0x02 | 热重载临时标记，增量比对后清理 |
-| `KCP_READ_PAUSED` | 0x04 | KCP 发送窗口高水位，暂停本地读取 |
-| `MGMT_CHANNEL` | 0x08 | 管理通道标记，收发走 mgmt_dispatch |
+| `STATIC_LISTENER` | 0x01 | 静态监听通道：不被热重载销毁，仅在配置显式移除时删除 |
+| `RELOAD_MARKED` | 0x02 | 热重载临时标记：新旧配置增量比对时标记残留通道以供清理 |
+| `KCP_READ_PAUSED` | 0x04 | KCP 读取暂停：发送窗口高水位时暂停本地 socket 读取 |
+| `MGMT_CHANNEL` | 0x08 | 管理通道标记：收发走 `mgmt_dispatch` 路径而非 proxy 转发 |
 
 ---
 
@@ -130,53 +168,132 @@ CLOSED ──(SYN)──► SYN_SENT ──(ACK)──► ESTABLISHED ──(FIN
 └──────────────────────┘                 └──────────────────────┘
 ```
 
-**通信模型**：
+### 2.3 通信模型
 
 ```
 客户端 ──TCP/UDP──► Frontend Worker ──AF_PACKET(KCP)──► Backend Worker ──TCP/UDP──► 目标服务
    透明代理            仅需 MAC/EtherType                仅需 MAC/EtherType           透明代理
 ```
 
-**约定**：
+**约束**：
 - 两台主机各运行一个 Master 进程
-- 管理通道（channel_id=0）在 AF_PACKET 上承载 JSON 消息，由 Manager 直接收发
-- 数据通道（channel_id≥1）分别由 Frontend Worker 和 Backend Worker 按配置分配到具体进程
-- Worker 由 Master 通过 `fork()` + `exec()` 启动，可配置 CPU 亲和性绑定
+- 管理通道（`channel_id=0`）由 Master 直接收发，承载 JSON 管理消息
+- 数据通道（`channel_id≥1`）由 Worker 进程按配置分配处理
+- Worker 由 Master 通过 `fork()` + `exec()` 启动，可配置 CPU 亲和性
+- 双方通道 ID 需对称对应：Frontend 的 channel_id=N 对 Backend 的 channel_id=N
+
+### 2.4 主事件循环
+
+```
+main()
+  ├── 解析命令行参数
+  ├── 加载 JSON 配置文件
+  ├── 验证配置一致性
+  ├── 初始化子系统（加密/管理/代理/AF_PACKET）
+  ├── 创建静态配置通道
+  ├── 进入主循环 (master_loop / worker_main)
+  │     │
+  │     ├── epoll_wait(timeout=10ms)
+  │     │     ├── EPOLLIN on raw_sock   → af_packet_recv → channel_process_frame
+  │     │     ├── EPOLLIN on listen_fd  → proxy_accept → assign to channel
+  │     │     ├── EPOLLIN on local_fd   → proxy_handle_local_read → channel_send_data
+  │     │     ├── EPOLLOUT on local_fd  → proxy_handle_local_write → kcp_wrap_recv
+  │     │     └── EPOLLIN on heartbeat_fd → 心跳/超时检查
+  │     │
+  │     ├── kcp_wrap_update(10ms)       → 驱动 KCP 定时器
+  │     ├── channel_timeout_check       → 超时通道回收
+  │     └── api_poll / mgmt_poll        → HTTP 请求 / 管理消息处理
+  │
+  └── cleanup → 销毁所有通道 → 释放资源 → 退出
+```
+
+### 2.5 信号处理
+
+| 信号 | 处理方式 | 效果 |
+|------|------|------|
+| `SIGTERM` / `SIGINT` | `sigwaitinfo` 同步等待 | 优雅关闭：停止 Worker → 清理通道 → 退出 |
+| `SIGHUP` | `sigwaitinfo` 同步等待 | 配置热重载：重新读取 JSON → 增量 diff 通道 |
+| `SIGUSR1` | `sigwaitinfo` 同步等待 | 通道 CTL：读取 `ctl.json` → 执行 add/del 指令 |
+| `SIGUSR2` | `sigwaitinfo` 同步等待 | 预留扩展 |
+| `SIGURG` | `sigwaitinfo` 同步等待 | 配置切换：切换配置文件路径 |
+| `SIGCHLD` | `sigwaitinfo` 同步等待 | 子进程收割：`waitpid(WNOHANG)` 循环回收僵尸 |
 
 ---
 
 ## 三、系统组件
 
-Gap-Proxy 由以下 14 个核心模块组成：
+Gap-Proxy 由以下 14 个核心模块组成，总计约 16,000 行核心 C 代码。
 
 ### 3.1 数据面组件
 
-| 组件 | 文件 | 职责 |
-|------|------|------|
-| **透明代理** | `proxy.c` | TCP/UDP 代理转发、epoll 事件循环、recv_buf 管理、KCP 背压控制、连接生命周期管理 |
-| **通道管理** | `channel.c` | 7 状态状态机、SYN/ACK/FIN/RST 握手、心跳检测、超时回收、通道哈希表 |
-| **AF_PACKET** | `af_packet.c` | 原始套接字收发、TPACKET_V2 零拷贝环形缓冲区、BPF 内核过滤、以太网帧构造/解析 |
-| **KCP 封装** | `kcp_wrap.c` | ikcp 创建/销毁/参数设置、发送/接收/更新接口、窗口/超时配置映射 |
-| **KCP 内核** | `ikcp.c` | 第三方 KCP 协议栈（skywind3000/kcp），ARQ 重传、流量控制、拥塞控制 |
-| **帧协议** | `myproto.c` | 9 字节紧凑帧头构建/解析、CRC-16 头校验 + CRC-32 尾帧、大端序列化/反序列化、加密帧处理 |
-| **加密** | `crypto.c` | SM4-CBC 加密/SM3-HMAC 校验、`/dev/urandom` IV 生成、恒时 HMAC 比较 |
-| **ACL** | `acl.c` | IP 地址匹配引擎（CIDR/精确/范围三种模式） |
+| 组件 | 文件 | 行数 | 职责 |
+|------|------|:---:|------|
+| **透明代理** | `proxy.c` | 2,089 | TCP/UDP 代理转发、epoll 事件循环（EPOLLET 边缘触发）、recv_buf 环形缓冲管理、KCP 背压控制、连接生命周期管理、`SO_ERROR` 诊断 |
+| **通道管理** | `channel.c` | 2,473 | 7 状态状态机、SYN/ACK/FIN/RST 握手、两级心跳策略（全局+逐通道）、超时回收、通道哈希表、`channel_send_ctrl` / `channel_send_data` |
+| **AF_PACKET** | `af_packet.c` | 1,039 | 原始套接字创建/绑定/发送/接收、TPACKET_V2 零拷贝环形缓冲区（256 帧 × 1600 字节）、BPF 内核过滤程序附加、以太网帧构造/解析 |
+| **KCP 封装** | `kcp_wrap.c` | 393 | ikcp 创建/销毁、`kcp_wrap_send` / `kcp_wrap_recv` / `kcp_wrap_update` 接口、KCP 参数映射（mtu/窗口/超时） |
+| **KCP 内核** | `ikcp.c` | 1,614 | 第三方 KCP 协议栈（skywind3000/kcp），ARQ 重传、滑动窗口流量控制、拥塞避免、RTO 计算 |
+| **帧协议** | `myproto.c` | 822 | 9 字节紧凑帧头构建/解析、CRC-16/CCITT 头校验 + CRC-32C 尾帧、big-endian 序列化/反序列化、加密帧标记与处理、帧验证与畸形帧拒绝 |
+| **加密** | `crypto.c` | 599 | SM4-CBC 加密/解密、SM3-HMAC 计算/验证、`/dev/urandom` IV 生成（`getrandom` 兜底）、恒时 HMAC 比较 |
+| **ACL** | `acl.c` | 118 | IP 地址匹配引擎：CIDR（`192.168.0.0/24`）、精确 IP（`10.0.0.1`）、IP 范围（`10.0.0.1-10.0.0.255`） |
 
 ### 3.2 控制面组件
 
-| 组件 | 文件 | 职责 |
-|------|------|------|
-| **管理协议** | `mgmt.c` | Manager↔Worker 间 13 种 JSON 管理消息的构建/解析/处理：注册、心跳、配置推送、实例调度、通道管控 |
-| **HTTP API** | `api.c` | 内嵌 Mongoose HTTP 服务器，16 个 RESTful 端点，Bearer Token 认证，远程 syslog |
-| **主程序** | `main.c` | 进程入口、信号处理（SIGHUP/SIGTERM/SIGUSR1/SIGCHLD）、配置加载/验证/热重载、Worker 生命周期管理、CTL JSON 指令执行 |
-| **CLI 工具** | `cli.c` | 独立命令行管理客户端（`gapproxy-cli`），通过 HTTP API 查询/管理集群 |
-| **插件系统** | `plugin.c` | 数据入站后置 hook（HP-4）、通道销毁前置 hook（HP-7） |
+| 组件 | 文件 | 行数 | 职责 |
+|------|------|:---:|------|
+| **管理协议** | `mgmt.c` | 2,465 | Manager↔Worker 间 13 种 JSON 管理消息构建/解析/分发（`mgmt_dispatch`）、注册/心跳/配置推送/SPAWN/KILL/CHANNEL_CTL、消息序列号防重放、Worker 注册表维护 |
+| **HTTP API** | `api.c` | 2,420 | 内嵌 Mongoose HTTP 服务器、16 个 RESTful 端点路由、Bearer Token 认证（`Authorization: Bearer <token>`）、请求校验、远程 syslog 支持 |
+| **主程序** | `main.c` | 5,204 | 进程入口、信号处理（`sigwaitinfo` 同步模式）、JSON 配置加载/验证/热重载（`config_reload`）、Worker 生命周期管理（`master_handle_spawn_request` / `kill_stuck_workers`）、CTL JSON 指令执行（`ctl_execute_json`）、CPU 亲和性绑定 |
+| **CLI 工具** | `cli.c` | 595 | 独立命令行管理客户端（`gapproxy-cli`）、通过 HTTP API 查询/管理集群、支持 `--follow` 日志流式输出 |
+| **插件系统** | `plugin.c` | 154 | HP-4：数据入站后置 hook（`plugin_invoke_channel_data_inbound`）、HP-7：通道销毁前置 hook（`plugin_invoke_channel_destroy`） |
 
 ### 3.3 公共基础
 
-| 组件 | 文件 | 职责 |
-|------|------|------|
-| **类型定义** | `types.h` | 全部结构体、枚举、常量、宏定义，约 1,800 行，是整个项目的数据结构基石 |
+| 组件 | 文件 | 行数 | 职责 |
+|------|------|:---:|------|
+| **类型定义** | `types.h` | 1,852 | 全部结构体（`channel_t`、`global_ctx_t`、`channel_config_t` 等）、枚举（状态机/角色/类型/加密）、常量（`MAX_CHANNELS`=256、`MAX_FRAME_SIZE` 等）、宏（`LOG_ERROR`/`time_now` 等）、模块 API 声明 |
+
+### 3.4 组件交互图
+
+```
+                          ┌──────────────────┐
+                          │     main.c        │
+                          │  入口/信号/配置    │
+                          └──┬───────┬──────┬─┘
+                             │       │      │
+              ┌──────────────┼───────┼──────┼──────────────┐
+              ▼              ▼       │      ▼              ▼
+        ┌──────────┐   ┌──────────┐  │  ┌──────────┐  ┌──────────┐
+        │  mgmt.c  │   │  api.c   │  │  │ plugin.c │  │  cli.c   │
+        │ 管理协议  │   │ HTTP API │  │  │ 插件系统  │  │ CLI 工具  │
+        └─────┬─────┘   └──────────┘  │  └──────────┘  └──────────┘
+              │ 管理通道               │
+              │ (channel_id=0)         │
+    ┌─────────┼────────────────────────┼─────────────────────────┐
+    │         ▼                        ▼                         │
+    │  ┌──────────────────────────────────────────────────┐      │
+    │  │              channel.c (通道层)                    │      │
+    │  │  哈希表 · 7 状态机 · 心跳 · 超时 · SYN/FIN/RST    │      │
+    │  └────┬─────────────────────────┬───────────────────┘      │
+    │       │ KCP 负载                │ 控制帧                    │
+    │       ▼                         ▼                          │
+    │  ┌──────────┐           ┌──────────────┐                   │
+    │  │ proxy.c  │           │  myproto.c   │                   │
+    │  │ 透明代理  │           │  帧协议/加密  │                   │
+    │  └────┬─────┘           └──────┬───────┘                   │
+    │       │ 数据帧                  │ 组帧/解帧                  │
+    │       └──────────┬─────────────┘                          │
+    │                  ▼                                         │
+    │         ┌───────────────┐                                  │
+    │         │  af_packet.c  │                                  │
+    │         │  L2 原始套接字 │                                  │
+    │         └───────┬───────┘                                  │
+    │                 │ sendto/recvfrom                          │
+    └─────────────────┼──────────────────────────────────────────┘
+                      ▼
+                 Linux 内核
+              (AF_PACKET + BPF)
+```
 
 ---
 
@@ -191,116 +308,276 @@ Gap-Proxy 由以下 14 个核心模块组成：
 └─────────┘   TCP    └────────────┘   KCP    └────────────┘   TCP    └──────────┘
 ```
 
-- **Frontend Worker**：监听本地 TCP/UDP 端口 → 接收客户端连接 → 通过 KCP 隧道封装转发到 Backend
-- **Backend Worker**：接收 KCP 隧道数据 → 解封装 → 连接到目标服务 → 双向转发
+**数据流（上行）**：
+
+```
+客户端 → local_fd (read) → KCP (channel_send_data) → MyProto 组帧 → AF_PACKET 发送
+```
+
+**数据流（下行）**：
+
+```
+AF_PACKET 接收 → MyProto 解帧 → KCP (kcp_wrap_recv) → local_fd (write)
+```
+
+**TCP vs UDP 代理差异**：
+
+| 维度 | TCP 代理 | UDP 代理 |
+|------|------|------|
+| 连接模型 | 有连接（accept/connect） | 无连接（sendto/recvfrom） |
+| local_fd 生命周期 | 每次 `accept` 新连接 → 绑定到通道 | 通道创建时 `socket` 一次，复用到关闭 |
+| recv_buf | 按需分配（初始 64KB，最大可到 `perf_max_memory_mb`） | 固定缓冲区 |
+| 背压保护 | `KCP_READ_PAUSED` 标志暂停本地 `read` | EPOLLOUT 通知写就绪 |
+| 关闭方式 | FIN 优雅断开（双向关闭） | 直接 `close` |
 
 ### 4.2 可靠传输（KCP）
 
-- **自动重传（ARQ）**：未确认数据段超时后自动重传
-- **流量控制**：发送/接收窗口限制在途数据量
-- **拥塞控制**：自适应调整发送速率，避免网络拥塞
-- **背压保护**：KCP 发送窗口满时自动暂停本地 socket 读取，防止内存暴涨
+#### 4.2.1 核心机制
+
+- **自动重传（ARQ）**：KCP 为每个发出的数据段设置超时（RTO），超时未确认则重传。RTO 根据 SRTT（平滑往返时间）和 RTTVAR（往返时间方差）动态计算。
+- **流量控制**：发送窗口（`snd_wnd`=128）和接收窗口（`rcv_wnd`=128）限制在途数据量。
+- **拥塞控制**：自适应调整发送速率，连续超时时减小窗口。
+- **快速重传**：收到 3 个以上跳过某个序列号的 ACK 时立即重传（不等待超时）。
+- **背压保护**：KCP 发送窗口满时，`channel_send_data` 返回 -1 → 调用者设置 `CH_FLAG_KCP_READ_PAUSED` → 暂停本地 `read` → 等待 KCP 窗口释放后通过 EPOLLOUT 恢复。
+
+#### 4.2.2 KCP 参数参考
+
+| 参数 | 默认值 | 范围 | 说明 |
+|------|:---:|:---:|------|
+| `mtu` | 1400 | 512-1478 | KCP 最大传输单元（不含帧头） |
+| `snd_wnd` | 128 | 32-1024 | 发送窗口大小（段数） |
+| `rcv_wnd` | 128 | 32-1024 | 接收窗口大小（段数） |
+| `nodelay` | 1 | 0-1 | 启用 nodelay 模式（降低延迟） |
+| `interval` | 10 | 5-100 | KCP 内部时钟滴答（ms） |
+| `resend` | 2 | 0-10 | 快速重传触发阈值（跳过 ACK 次数） |
+| `nc` | 1 | 0-1 | 是否关闭拥塞控制（`1`=关闭，纯流量控制） |
+
+**最大在途数据量**：`snd_wnd × mtu = 128 × 1400 = 179,200 字节`
+
+#### 4.2.3 KCP 与系统时钟的关系
+
+- KCP 通过 `kcp_wrap_update(current_ms)` 每 10ms 驱动一次定时器
+- `current_ms` 来自 `time_now()`（`CLOCK_MONOTONIC`），单调递增，不受系统时间调整影响
+- 主事件循环 `epoll_wait(timeout=10ms)` 与 KCP 定时器同步
+- `epoll_wait` 可能因信号提前返回（EINTR）→ KCP 可能以高于 10ms 的频率更新，不影响正确性
 
 ### 4.3 加密与安全
 
-- **帧级加密**：每个 MyProto 帧独立加密，IV 从 `/dev/urandom` 随机生成
-- **Encrypt-then-MAC**：先 SM4-CBC 加密明文，再对密文计算 SM3-HMAC
-- **管理通道保护**：管理通道可使用独立密钥，与数据通道隔离
-- **防重放**：管理消息包含单调递增序列号，拒绝低序列号消息
-- **Token 安全**：API Token 使用 `getrandom()` 系统调用安全随机生成
-- **HMAC 恒时比较**：防止时序侧信道攻击
-- **IP ACL**：支持 CIDR/精确 IP/范围三种匹配模式
+#### 4.3.1 加密帧结构
+
+```
+明文帧:  [MyProto Header(9)] [Plaintext Payload(N)] [CRC32 Tail(4)]
+
+加密后:  [MyProto Header(9)] [Ciphertext(N+p)] [SM3-HMAC(32)] [CRC32 Tail(4)]
+                              └── SM4-CBC 加密 ──┘ └── 认证标签 ──┘
+```
+
+加密流程：
+1. IV = `getrandom(16)` 从 `/dev/urandom` 获取随机数
+2. `ciphertext = SM4_CBC_Encrypt(key, iv, plaintext)` → PKCS7 填充
+3. `hmac = SM3_HMAC(auth_key, header || iv || ciphertext)` → 关联数据认证
+4. 输出 = `iv(16) || ciphertext || hmac(32)`
+5. 帧头 `flags` 置 `MPF_CRYPTO` 位
+
+**加密开销**：16（IV） + 1~16（PKCS7 填充） + 32（HMAC）= 49~64 字节/帧
+
+#### 4.3.2 安全机制汇总
+
+| 机制 | 实现 | 防御 |
+|------|------|------|
+| 帧级加密 | 每帧独立 IV + SM4-CBC | 密钥流复用攻击 |
+| Encrypt-then-MAC | 先加密，后对密文和关联数据认证 | Padding Oracle |
+| 恒时 HMAC 比较 | 逐字节 XOR + 累加，不提前返回 | 时序侧信道 |
+| 管理消息序列号 | 单调递增 `mgmt_seq`，拒绝 `seq ≤ last_seq` | 重放攻击 |
+| API Token | `getrandom()` 安全随机生成 64 字符十六进制 | Token 猜测 |
+| IP ACL | CIDR/精确/范围三种模式白名单 | 未授权 IP 访问 |
+| 管理通道密钥隔离 | `mgmt_keys[]` 独立于 `data_keys[]` | 密钥交叉攻击 |
+| 共享密钥空间 | `shared_secret` 统一管理，`explicit_bzero` 清零 | 密钥内存残留 |
 
 ### 4.4 集群管理
 
-**管理通道（channel_id=0）**承载以下 13 种 JSON 消息类型：
+#### 4.4.1 管理消息协议
 
-| 消息类型 | 方向 | 功能 |
-|----------|------|------|
-| `NODE_REGISTER` | Worker→Manager | Worker 注册（含节点 ID、版本、角色） |
-| `NODE_REGISTER_ACK` | Manager→Worker | 注册确认（成功/拒绝/重放检测） |
-| `NODE_KEEPALIVE` | Worker→Manager | Worker 心跳 |
-| `NODE_KEEPALIVE_ACK` | Manager→Worker | 心跳回复 |
-| `CONFIG_PUSH` | Manager→Worker | 配置下发（全局 + 通道配置） |
-| `CONFIG_PUSH_ACK` | Worker→Manager | 配置确认 |
-| `CONFIG_SWITCH` | Manager→Worker | 配置文件路径切换指令 |
-| `SPAWN_INSTANCE` | Manager→Worker | 启动新 Worker 实例 |
-| `SPAWN_ACK` | Worker→Manager | SPAWN 结果确认 |
-| `KILL_INSTANCE` | Manager→Worker | 停止 Worker 实例 |
-| `CHANNEL_CTL` | Manager→Worker | 通道动态管理（add/del/list） |
-| `CHANNEL_CTL_ACK` | Worker→Manager | 通道操作确认 |
-| `NODE_UNREGISTER` | Worker→Manager | Worker 注销 |
+管理通道（`channel_id=0`）承载 JSON 消息，通用格式：
+
+```json
+{
+    "type": "NODE_REGISTER",
+    "seq": 42,
+    "ts": 1718700000,
+    "node_id": "worker-frontend-01",
+    "version": "1.0.0",
+    "... 消息特定字段 ..."
+}
+```
+
+**公共字段**：`type`（消息类型）、`seq`（单调递增序列号）、`ts`（Unix 时间戳）、`node_id`（节点标识符）。
+
+#### 4.4.2 消息类型一览
+
+| 消息类型 | 方向 | 触发 | 关键字段 |
+|----------|------|------|------|
+| `NODE_REGISTER` | Worker→Manager | Worker 启动时 | `instance_config`（配置路径） |
+| `NODE_REGISTER_ACK` | Manager→Worker | 注册成功后 | `status`（ok/rejected/replay） |
+| `NODE_KEEPALIVE` | Worker→Manager | 周期性心跳 | `uptime_seconds` |
+| `NODE_KEEPALIVE_ACK` | Manager→Worker | 心跳回复 | — |
+| `CONFIG_PUSH` | Manager→Worker | API/热重载触发 | `config`（完整 JSON 对象） |
+| `CONFIG_PUSH_ACK` | Worker→Manager | 配置应用后 | `status`、`channels_enabled` |
+| `CONFIG_SWITCH` | Manager→Worker | API 触发 | `instance_name`、`config_path` |
+| `SPAWN_INSTANCE` | Manager→Worker | API 触发 SPAWN | `instance_name`、`config_path`、`cpu_affinity` |
+| `SPAWN_ACK` | Worker→Manager | SPAWN 完成后 | `status`、`instance_name` |
+| `KILL_INSTANCE` | Manager→Worker | API 触发 KILL | `instance_name` |
+| `CHANNEL_CTL` | Manager→Worker | API/CTL 信号触发 | `op`（add/del）、`channel_id`、`channel_config` |
+| `CHANNEL_CTL_ACK` | Worker→Manager | 通道操作后 | `added`、`deleted`、`errors` |
+| `NODE_UNREGISTER` | Worker→Manager | Worker 退出前 | — |
 
 ### 4.5 HTTP 管理 API
 
-系统提供 16 个 RESTful API 端点：
+#### 4.5.1 端点一览
 
-| 方法 | 端点 | 功能 |
-|------|------|------|
-| `GET` | `/api/v1/status` | 节点状态、Worker 列表 |
-| `GET` | `/api/v1/metrics` | Prometheus 格式监控指标 |
-| `GET` | `/api/v1/nodes` | 集群节点列表 |
-| `GET` | `/api/v1/channels` | 全部通道状态 |
-| `GET` | `/api/v1/sessions` | 活跃会话列表 |
-| `GET` | `/api/v1/config` | 当前配置查看 |
-| `POST` | `/api/v1/config/push` | 配置推送 |
-| `POST` | `/api/v1/config/switch` | 实例配置切换 |
-| `GET` | `/api/v1/config/version` | 配置版本号 |
-| `POST` | `/api/v1/instances/spawn` | 启动新 Worker |
-| `POST` | `/api/v1/instances/spawn-batch` | 批量启动 Worker |
-| `POST` | `/api/v1/instances/kill` | 停止 Worker |
-| `POST` | `/api/v1/instances/channels` | SPAWN 实例通道管理 |
-| `GET` | `/api/v1/stats` | 全局流量统计 |
-| `GET` | `/api/v1/logs` | 获取日志输出 |
-| `POST` | `/api/v1/reload` | 触发热重载 |
+| 方法 | 端点 | 认证 | 功能 |
+|------|------|:---:|------|
+| `GET` | `/api/v1/status` | Bearer | 节点状态、Worker 列表、启动时间 |
+| `GET` | `/api/v1/metrics` | Bearer | Prometheus 格式监控指标 |
+| `GET` | `/api/v1/nodes` | Bearer | 集群节点列表及状态 |
+| `GET` | `/api/v1/channels` | Bearer | 全部通道状态（channel_id/state/role/stats） |
+| `GET` | `/api/v1/channels/<id>` | Bearer | 单个通道详情 |
+| `GET` | `/api/v1/sessions` | Bearer | 活跃会话列表 |
+| `GET` | `/api/v1/config` | Bearer | 当前完整配置（JSON） |
+| `POST` | `/api/v1/config/push` | Bearer | 向指定 Worker 推送配置 |
+| `POST` | `/api/v1/config/switch` | Bearer | 切换实例配置文件路径 |
+| `GET` | `/api/v1/config/version` | Bearer | 配置版本号 |
+| `POST` | `/api/v1/instances/spawn` | Bearer | 启动新 Worker 实例（单次） |
+| `POST` | `/api/v1/instances/spawn-batch` | Bearer | 批量启动 Worker 实例 |
+| `POST` | `/api/v1/instances/kill` | Bearer | 停止指定 Worker 实例 |
+| `POST` | `/api/v1/instances/channels` | Bearer | SPAWN 实例通道管理（add/del/status） |
+| `GET` | `/api/v1/stats` | Bearer | 全局流量统计（总帧数/总字节/总错误） |
+| `GET` | `/api/v1/logs` | Bearer | 获取日志输出（支持 `?lines=N`） |
+| `POST` | `/api/v1/reload` | Bearer | 触发热重载（等价于 `kill -HUP`） |
+
+#### 4.5.2 认证流程
+
+```
+Client                          Gap-Proxy API
+  │                                    │
+  │  GET /api/v1/status                │
+  │  Authorization: Bearer <token>     │
+  │ ──────────────────────────────────►│
+  │                                    │ api_check_auth(token)
+  │                                    │   → strcmp(token, config.api_token)
+  │                                    │   → 成功：继续 │ 失败：401
+  │◄────────────────────────────────── │
+  │  200 {"status":"running", ...}     │
+```
 
 ### 4.6 Worker 生命周期管理
 
 ```
-          SPAWN_INSTANCE
-Master ─────────────────► Worker (主进程)
-                              │
-                              │ fork() + exec()
-                              ▼
-                         Worker 子进程
-                              │
-                              │ NODE_REGISTER
-                              ▼
-                         Manager 确认注册
-                              │
-                         ┌────┴────┐
-                         │ 正常运行 │ (数据面 + 心跳)
-                         └────┬────┘
-                              │
-          KILL_INSTANCE       │
-Master ─────────────────► Worker 主进程
-                              │
-                              │ SIGTERM → SIGKILL
-                              ▼
-                         进程退出 + 回收
+          SPAWN_INSTANCE (管理消息)
+Master ───────────────────────────► Worker (主进程)
+                                        │
+                                        │ fork() + exec()
+                                        ▼
+                                   Worker 子进程
+                                        │
+                                        │ NODE_REGISTER (管理消息)
+                                        ▼
+                                   Manager 确认注册
+                                        │
+                                   ┌────┴────┐
+                                   │ 正常运行  │ (数据面 + 心跳周期)
+                                   └────┬────┘
+                                        │
+          KILL_INSTANCE (管理消息)       │
+Master ───────────────────────────► Worker 主进程
+                                        │
+                                        │ SIGTERM (等待 30s)
+                                        │ SIGKILL (强制)
+                                        ▼
+                                   进程退出 + waitpid 非阻塞回收
 ```
 
-- **SPAWN**：通过 HTTP API 或管理消息触发，在目标主机上 `fork()` + `exec()` 新 Worker 实例
-- **KILL**：向指定 Worker 发送 `SIGTERM`，超时后 `SIGKILL`，非阻塞回收
-- **重启保护**：Worker 异常退出后由 Master 自动重启（可配置次数限制）
-- **CPU 亲和性**：每个 Worker 可绑定到指定 CPU 核心，避免缓存颠簸
+**关键机制**：
+- **SPAWN 确认超时**：Master 发送 SPAWN_INSTANCE 后轮询等待 `SPAWN_WAIT_RETRIES × SPAWN_WAIT_US`（50 × 10ms = 500ms），超时视为失败
+- **KILL 分级**：先 `SIGTERM`（优雅退出）→ 30 秒后 `SIGKILL`（强制终止）→ `waitpid(WNOHANG)` 立即回收
+- **崩溃重启**：Worker 异常退出后由 Master 的 `restart_worker` 逻辑自动重启（可配置次数上限）
+- **CPU 亲和性**：`cpu_affinity` 配置 → `sched_setaffinity()` 绑定进程到指定核心
+- **冲突检测**：启动时检测多个 Worker 绑定同一 CPU 核心，输出警告
 
 ### 4.7 配置热重载
 
-- **SIGHUP 信号**触发全量配置重载
-- 通道增量 diff：仅关闭移除的通道、仅创建新增的通道，已有连接不受影响
-- 通过 `CH_FLAG_RELOAD_MARKED` 标志位实现新旧配置比对
-- **SIGUSR1 CTL 信号**触发 JSON 指令，支持运行时 add/del 通道
-- `CONFIG_SWITCH` 管理消息支持配置文件路径热切换
+#### 4.7.1 全量重载（SIGHUP）
+
+```
+SIGHUP → config_reload()
+  ├── 加载新 JSON 配置文件
+  ├── 验证配置一致性
+  ├── Step 1: 标记所有现存通道为 RELOAD_MARKED
+  ├── Step 2: 遍历新配置
+  │     ├── 已存在且未改变 → 清除 RELOAD_MARKED（保留）
+  │     ├── 不存在 → channel_create（创建）
+  │     └── enabled=false → channel_destroy（销毁）
+  ├── Step 3: 清理仍带 RELOAD_MARKED 的通道（已从新配置移除）
+  └── Step 4: 更新全局配置参数
+```
+
+#### 4.7.2 通道级 CTL（SIGUSR1）
+
+```
+SIGUSR1 → 读取 ctl.json 文件 → ctl_execute_json()
+  ├── op: "add"     → channel_create → channel_send_ctrl(SYN) → 启动握手
+  ├── op: "del"     → channel_send_ctrl(FIN) → 等待关闭 → channel_destroy
+  └── op: "status"  → 打印当前通道状态 JSON
+```
 
 ### 4.8 可观测性
 
-- **通道级统计**：每通道独立计数器（tx_frames/rx_frames/tx_bytes/rx_bytes/tx_errors 等）
-- **Worker 级统计**：聚合该 Worker 所有通道的统计
-- **全局统计**：channel_count、通道创建/销毁速率
-- **Prometheus 端点**：`/api/v1/metrics` 输出 Prometheus 格式指标
-- **CLI 工具**：`gapproxy-cli status/channels/stats/logs` 查询实时状态
-- **远程 syslog**：可配置远程 syslog 服务器，支持 UDP 传输
+#### 4.8.1 统计计数器
+
+**通道级**（每通道独立）：
+
+| 计数器 | 类型 | 说明 |
+|------|:---:|------|
+| `tx_frames` / `rx_frames` | uint64 | 发送/接收帧总数 |
+| `tx_bytes` / `rx_bytes` | uint64 | 发送/接收字节总数 |
+| `tx_errors` / `rx_errors` | uint64 | 发送/接收错误次数 |
+| `kcp_snd_una` / `kcp_rcv_nxt` | uint32 | KCP 发送/接收窗口前沿（实时快照） |
+
+**Worker 级**：聚合该 Worker 所有通道的统计。
+
+**全局级**（`global_ctx_t`）：
+
+| 计数器 | 说明 |
+|------|------|
+| `channel_count` | 当前活跃通道数 |
+| `channel_create_total` | 累计创建通道数 |
+| `channel_destroy_total` | 累计销毁通道数 |
+| `channel_create_max_per_sec` | 每秒最大创建速率（性能基准） |
+
+#### 4.8.2 日志系统
+
+```
+LOG_ERROR  → stderr + syslog + API /logs（始终输出）
+LOG_WARN   → stderr + syslog + API /logs（始终输出）
+LOG_INFO   → stderr + syslog + API /logs（默认）
+LOG_DEBUG  → stderr + syslog + API /logs（仅 debug 构建）
+LOG_AUDIT  → stderr + syslog（安全审计事件专用）
+```
+
+**远程 syslog**：通过 `log_syslog_remote` 配置 UDP syslog 服务器地址（`host:port`），日志实时发送。
+
+#### 4.8.3 Prometheus 端点
+
+`GET /api/v1/metrics` 返回 Prometheus 格式指标：
+
+```
+# HELP gap_proxy_channels_active Number of active channels
+# TYPE gap_proxy_channels_active gauge
+gap_proxy_channels_active 42
+# HELP gap_proxy_frames_total Total frames processed
+# TYPE gap_proxy_frames_total counter
+gap_proxy_frames_total{channel="1",direction="tx"} 1024000
+```
 
 ---
 
@@ -321,19 +598,22 @@ Master ─────────────────► Worker 主进程
          无 IP 路由可达                                       无 IP 路由可达
 ```
 
+**配置要点**：双方配置对端 MAC、相同 EtherType、通道 ID 对称。
+
 ### 5.2 高性能代理隧道
 
 **场景**：需要比传统 VPN/IPSec/GRE 更低延迟、更高吞吐的代理隧道。
 
-**方案**：利用 AF_PACKET 零拷贝 + KCP 协议，绕过内核 TCP/IP 协议栈，实现接近线速的转发性能。
+**对比**：
 
-| 对比维度 | 传统 VPN (IPSec) | Gap-Proxy |
-|----------|:---:|:---:|
+| 维度 | 传统 VPN (IPSec) | Gap-Proxy |
+|------|:---:|:---:|
 | 协议层 | L3 (IP) | L2 (Ethernet) |
-| 内核旁路 | 否 | 是（AF_PACKET 零拷贝） |
-| 传输协议 | ESP/AH | KCP（可调参数） |
-| 加密 | 内置 | SM4-CBC + SM3-HMAC |
-| 延迟 | ~1ms+ | ~0.3ms（KCP 参数优化后） |
+| 内核旁路 | 否（内核 IPsec 栈） | 是（AF_PACKET 零拷贝） |
+| 传输协议 | ESP/AH（固定参数） | KCP（窗口/延迟/重传全可调） |
+| 加密 | AES-GCM（硬件加速） | SM4-CBC + SM3-HMAC（软件） |
+| 延迟 | ~1ms+（内核协议栈开销） | ~0.3ms（KCP nodelay 模式） |
+| 适用场景 | 通用站点互联 | 低延迟数据面定制场景 |
 
 ### 5.3 多流复用的代理网关
 
@@ -342,9 +622,9 @@ Master ─────────────────► Worker 主进程
 **方案**：利用 Gap-Proxy 的多通道机制，每个通道独立 KCP 实例 + 独立密钥 + 独立窗口参数。
 
 ```
-客户端端口 8080 ──► 通道 1 (key_A) ──► 后端服务 A
-客户端端口 9090 ──► 通道 2 (key_B) ──► 后端服务 B
-客户端端口 3306 ──► 通道 3 (key_C) ──► 数据库 C
+客户端端口 8080 ──► 通道 1 (key_A, wnd=128) ──► 后端服务 A
+客户端端口 9090 ──► 通道 2 (key_B, wnd=256) ──► 后端服务 B（高吞吐）
+客户端端口 3306 ──► 通道 3 (key_C, wnd=64)  ──► 数据库 C（低延迟）
 ```
 
 ### 5.4 集群多实例负载分担
@@ -360,14 +640,38 @@ Master ──► Worker 1 (CPU 0) ──► 通道 1-50
        └──► Worker 4 (CPU 3) ──► 通道 151-200
 ```
 
+**容量估算**：4 Worker × 50 通道 × 179KB KCP 窗口 = ~35MB 内存 + ~240 FD
+
 ### 5.5 远程配置管理与自动化运维
 
 **场景**：大量代理节点的配置需要集中管理，根据流量动态调整通道参数。
-
-**方案**：Manager-Worker 协议支持从中心 Manager 向所有 Worker 推送配置更新，通过 HTTP API 批量操作。
 
 ```
 运维平台 ──HTTP API──► Manager ──CONFIG_PUSH──► Worker 1
                                      ├──────────► Worker 2
                                      └──────────► Worker N
 ```
+
+**运维命令示例**：
+
+```bash
+# 查看集群状态
+gapproxy-cli status -s manager:8080 -t "$TOKEN"
+
+# 推送新配置
+gapproxy-cli config-push -s manager:8080 -t "$TOKEN" -n worker-frontend-01 -f new_config.json
+
+# 按需扩容
+gapproxy-cli spawn -s manager:8080 -t "$TOKEN" -f worker_config.json
+
+# 实时监控
+gapproxy-cli logs -s manager:8080 -t "$TOKEN" --follow
+
+# 通道动态增删
+gapproxy-cli channel-add -s manager:8080 -t "$TOKEN" -w worker-01 \
+  '{"channel_id":99,"listen_port":9999,"remote_port":80,"remote_addr":"10.0.0.1","is_tcp":true}'
+```
+
+---
+
+*最后更新：2026-06-18*
