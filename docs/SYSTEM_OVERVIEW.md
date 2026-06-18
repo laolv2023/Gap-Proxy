@@ -67,13 +67,15 @@ Byte  N..N+3: frame_crc32  (uint32_t, little-endian) CRC-32C 全帧校验
 | `FRONTEND` | 0 | 前端节点：接收客户端 TCP/UDP 连接，通过 KCP 隧道转发到后端 |
 | `BACKEND` | 1 | 后端节点：接收前端转发的 KCP 流量，代理到目标服务 |
 
-### 1.5 通道角色（Channel Role）
+### 1.5 通道角色（Channel Role）— 内部运行时角色，不暴露于配置
 
-| 角色 | 值 | 定义 |
-|------|:---:|------|
-| `INITIATOR` | 0 | 主动发起方：发送 SYN 帧驱动三次握手。由 LISTENER accept 新客户端连接后创建 |
-| `RESPONDER` | 1 | 被动响应方：收到对端 SYN 后动态创建。根据本节点类型确定本地动作：Frontend 连接远端服务（`proxy_connect_remote`）；Backend 监听本地端口（`proxy_start_listen`）。回复 ACK 完成握手 |
-| `LISTENER` | 2 | 纯监听方：仅 bind+listen 本地 TCP/UDP 端口。accept 新客户端后派生 INITIATOR 子通道，自身不参与 KCP 数据传输 |
+通道角色由程序在运行时根据协议交互自动分配，用户配置文件中不存在此字段。
+
+| 角色 | 值 | 分配时机 | 行为 |
+|------|:---:|------|------|
+| `INITIATOR` | 0 | LISTENER accept 新客户端后派生 | 发送 SYN 帧驱动三次握手 |
+| `RESPONDER` | 1 | 收到对端 SYN 且本端无此通道时动态创建 | 回复 ACK 完成握手；根据本节点 `node_type` 确定本地动作：Frontend 连接远端服务，Backend 监听本地端口 |
+| `LISTENER` | 2 | 程序启动时从 `config.channels[]` 创建 | 仅 bind+listen 本地端口，accept 后派生 INITIATOR，自身不参与 KCP 数据传输 |
 
 ### 1.6 通道状态机（Channel State）
 
