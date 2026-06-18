@@ -9,24 +9,6 @@
     透明代理        仅需 MAC/EtherType        仅需 MAC/EtherType      透明代理
 ```
 
-### 部署模式
-
-两台主机各运行一个 Master 进程，每个 Master 通过 `fork()` + `exec()` 管理多个不同方向（Frontend/Backend）的 Worker 实例：
-
-```
-主机 A (Frontend)                          主机 B (Backend)
-┌──────────────────────┐                 ┌──────────────────────┐
-│ Master                │   AF_PACKET    │ Master                │
-│ ├─ Worker (frontend)  │◄──────────────►│ ├─ Worker (backend)   │
-│ ├─ Worker (frontend)  │  (channel_id=N)│ ├─ Worker (backend)   │
-│ └─ ... (最多 64)      │                 │ └─ ... (最多 64)      │
-│ API :8080             │   AF_PACKET    │ API :8080             │
-└──────────────────────┘  (channel_id=0) └──────────────────────┘
-                         管理通道(JSON)
-```
-
-**版本**: 1.0.0 | **语言**: C (GNU11) | **平台**: Linux (≥ 2.6.31) | **代码**: ~16,000 行
-
 ---
 
 ## 系统特性
@@ -48,21 +30,3 @@
 | **插件系统** | HP-4 数据入站 hook + HP-7 通道生命周期 hook，支持数据面自定义扩展 |
 | **安全防护** | 管理消息序列号防重放、HMAC 恒时比较、Token 安全随机生成、IP ACL 白名单、管理通道独立加密密钥 |
 | **全面可观测** | 通道/Worker/全局三级统计计数器、Prometheus 风格 metrics 端点、远程 syslog、Core dump 诊断 |
-
-### 模块组成
-
-```
-Gap-Proxy 源码 (24 个文件)
-
-  数据面                        控制面
-  ┌─────────────┐            ┌─────────────┐
-  │ proxy.c     │            │ mgmt.c      │ Manager↔Worker 管理协议
-  │ channel.c   │ 7状态机    │ api.c       │ HTTP REST API
-  │ af_packet.c │ L2 收发    │ cli.c       │ 命令行管理工具
-  │ kcp_wrap.c  │ KCP 适配   │ plugin.c    │ 插件系统
-  │ ikcp.c      │ KCP 内核   │ main.c      │ 入口/信号/Worker 管理
-  │ myproto.c   │ 帧协议     └─────────────┘
-  │ crypto.c    │ 加密
-  │ acl.c       │ ACL
-  └─────────────┘
-```
