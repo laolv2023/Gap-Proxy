@@ -71,9 +71,9 @@ Byte  N..N+3: frame_crc32  (uint32_t, little-endian) CRC-32C 全帧校验
 
 | 角色 | 值 | 定义 |
 |------|:---:|------|
-| `INITIATOR` | 0 | 主动发起方：发送 SYN 帧驱动三次握手 |
-| `RESPONDER` | 1 | 被动响应方：收到 SYN 后回复 ACK 完成握手 |
-| `LISTENER` | 2 | 纯监听方：仅监听本地端口，由对端 SYN 触发握手 |
+| `INITIATOR` | 0 | 主动发起方：发送 SYN 帧驱动三次握手。由 LISTENER accept 新客户端连接后创建 |
+| `RESPONDER` | 1 | 被动响应方：收到对端 SYN 后动态创建。根据本节点类型确定本地动作：Frontend 连接远端服务（`proxy_connect_remote`）；Backend 监听本地端口（`proxy_start_listen`）。回复 ACK 完成握手 |
+| `LISTENER` | 2 | 纯监听方：仅 bind+listen 本地 TCP/UDP 端口。accept 新客户端后派生 INITIATOR 子通道，自身不参与 KCP 数据传输 |
 
 ### 1.6 通道状态机（Channel State）
 
