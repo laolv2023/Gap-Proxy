@@ -67,17 +67,7 @@ Byte  N..N+3: frame_crc32  (uint32_t, little-endian) CRC-32C 全帧校验
 | `FRONTEND` | 0 | 前端节点：接收客户端 TCP/UDP 连接，通过 KCP 隧道转发到后端 |
 | `BACKEND` | 1 | 后端节点：接收前端转发的 KCP 流量，代理到目标服务 |
 
-### 1.5 通道角色（Channel Role）— 内部运行时角色，不暴露于配置
-
-通道角色由程序在运行时根据协议交互自动分配，用户配置文件中不存在此字段。
-
-| 角色 | 值 | 分配时机 | 行为 |
-|------|:---:|------|------|
-| `INITIATOR` | 0 | LISTENER accept 新客户端后派生 | 发送 SYN 帧驱动三次握手 |
-| `RESPONDER` | 1 | 收到对端 SYN 且本端无此通道时动态创建 | 回复 ACK 完成握手；根据本节点 `node_type` 确定本地动作：Frontend 连接远端服务，Backend 监听本地端口 |
-| `LISTENER` | 2 | 程序启动时从 `config.channels[]` 创建 | 仅 bind+listen 本地端口，accept 后派生 INITIATOR，自身不参与 KCP 数据传输 |
-
-### 1.6 通道状态机（Channel State）
+### 1.5 通道状态机（Channel State）
 
 ```
 CLOSED ──(SYN)──► SYN_SENT ──(ACK)──► ESTABLISHED ──(FIN)──► FIN_SENT
@@ -99,14 +89,14 @@ CLOSED ──(SYN)──► SYN_SENT ──(ACK)──► ESTABLISHED ──(FIN
 | `FIN_RCVD` | 已收到 FIN 帧，已回复 ACK，等待本地关闭 | 3s | 收到对端 FIN |
 | `CLOSED_ZOMBIE` | 等待超时回收的僵尸状态 | 5s | FIN/RST 交换完成 |
 
-### 1.7 加密模式
+### 1.6 加密模式
 
 | 模式 | 值 | 密钥长度 | IV 长度 | HMAC 长度 | 定义 |
 |------|:---:|:---:|:---:|:---:|------|
 | `NONE` | 0 | — | — | — | 不加密，payload 明文传输（仅可信内网） |
 | `SM4_SM3` | 1 | 16 字节 | 16 字节 | 32 字节 | SM4-CBC + SM3-HMAC（生产推荐） |
 
-### 1.8 通道标志（Channel Flags）
+### 1.7 通道标志（Channel Flags）
 
 | 标志 | 值 | 定义 |
 |------|:---:|------|
